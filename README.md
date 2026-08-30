@@ -4,7 +4,12 @@ A vertical ninja runner for the **LilyGO TTGO T-Display** (ESP32, 1.14" ST7789, 
 
 <p align="center">
   <img src="images/title.png" width="24%" alt="Title screen">
-  <img src="images/gameplay.png" width="24%" alt="A demon approaches">
+  <img src="images/village.png" width="24%" alt="Torii Village at dusk">
+  <img src="images/pass.png" width="24%" alt="Rocky Pass at night">
+  <img src="images/summit.png" width="24%" alt="Snowy Summit at dawn">
+</p>
+<p align="center">
+  <img src="images/gameplay.png" width="24%" alt="Bamboo Grove">
   <img src="images/bamboo.png" width="24%" alt="Bamboo stalk ahead">
   <img src="images/gameover.png" width="24%" alt="Game over">
 </p>
@@ -34,7 +39,8 @@ Strict pairing — every obstacle has exactly one correct answer:
 - **3 hearts**, brief invincibility after a hit; speed ramps up gently forever.
 - **Combo multiplier** (up to ×8) grows with consecutive correct clears; one hit resets it.
 - **Coins**: ground coins are grabbed while grounded, ringed **air coins only mid-leap**. Every 10th coin restores a lost heart (or +50 score at full health).
-- **Day-night cycle**: the palette rolls through day, dusk, starry night, and dawn as you run.
+- **A journey, not a treadmill**: the lane S-curves and narrows as it climbs through four looping zones — **Bamboo Grove** (morning, falling leaves) → **Torii Village** (dusk, fireflies) → **Rocky Pass** (starry night, narrow winding trail) → **Snowy Summit** (dawn, snowfall). Each zone leans on its own obstacles and scenery.
+- **Zone gates**: a big torii spans the path at every boundary — crossing it announces the next stage and **restores a heart**. Every full lap raises the pace.
 - Best score survives power-off (NVS flash).
 
 ## Presenter mode 🎤
@@ -73,6 +79,7 @@ Connect at 115200 baud and send:
 - `S` — dumps the current frame as raw RGB565 (`SNAP\n` + 64800 bytes). The README screenshots were captured this way.
 - `J` / `K` — remote leap / slash, so the game can be driven (or demoed) over USB.
 - `P` — toggle Presenter mode (enters it, or restarts back to the game).
+- `D` — debug: skip ahead one zone.
 
 ## Tuning
 

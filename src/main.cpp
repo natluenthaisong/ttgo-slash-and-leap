@@ -79,16 +79,43 @@ constexpr uint16_t COL_HEART_E  = C565(120, 110, 110);
 constexpr uint16_t COL_PANEL    = C565(232, 226, 160);
 constexpr uint16_t COL_TEXT_DK  = C565(84, 66, 28);
 
-// day-night keyframes: day, dusk, night, dawn
+// ---------- zones: the journey loops Grove -> Village -> Pass -> Summit ----------
 struct RGB { uint8_t r, g, b; };
-const RGB KF_SKY_T[4] = {{120,190,235},{250,150, 90},{ 18, 24, 60},{170,160,220}};
-const RGB KF_SKY_B[4] = {{200,235,245},{255,205,130},{ 40, 50, 95},{255,205,170}};
-const RGB KF_GRASS[4] = {{110,185, 90},{130,150, 70},{ 38, 72, 62},{ 95,160, 95}};
-const RGB KF_PATH [4] = {{225,205,150},{215,180,130},{112,108,112},{205,190,150}};
+enum WxKind { WX_LEAVES = 0, WX_FIREFLY, WX_NONE, WX_SNOW };
 
-// current environment colors, recomputed each frame from distance
+struct ZoneDef {
+  const char *name;
+  RGB skyT, skyB, grass, path;
+  uint8_t wBamboo, wDemon, wSpikes, wRock;   // obstacle weights, sum 100
+  int8_t  pathW;                             // lane width
+  int8_t  curveAmp;                          // how hard the lane S-curves
+  uint8_t weather;
+  bool    night;
+};
+
+constexpr int ZONE_LEN = 1600;               // px of world per zone (~13 s)
+const ZoneDef ZONES[4] = {
+  {"BAMBOO GROVE",  {120,190,235},{200,235,245},{110,185, 90},{225,205,150}, 45,20,20,15, 76,  8, WX_LEAVES,  false},
+  {"TORII VILLAGE", {250,150, 90},{255,205,130},{130,150, 70},{215,180,130}, 15,45,20,20, 70,  4, WX_FIREFLY, false},
+  {"ROCKY PASS",    { 18, 24, 60},{ 40, 50, 95},{ 38, 72, 62},{112,108,112}, 10,20,30,40, 60, 14, WX_NONE,    true},
+  {"SNOWY SUMMIT",  {170,160,220},{255,205,170},{222,232,238},{202,198,190}, 10,15,45,30, 66, 10, WX_SNOW,    false},
+};
+
+// current environment, recomputed each frame from distance (zone-blended)
 uint16_t envSkyT, envSkyB, envGrass, envGrassDk, envPath, envPathEdge, envShadow;
-float nightness = 0;   // 0 day .. 1 deep night
+float nightness = 0;
+float pathWNow = 76, curveAmpNow = 8;
+int   ninjaX = NINJA_X;                      // follows the lane's curve at the ninja's row
+
+// weather particles
+struct WxP { bool active = false; uint8_t kind = 0; float x = 0, y = 0, vx = 0, vy = 0; };
+constexpr int N_WX = 10;
+WxP wxp[N_WX];
+
+// zone-gate bookkeeping
+int         lastZoneIdx = 0;
+int         bannerT = 0, bannerStage = 0;
+const char *bannerName = "";
 
 // ---------- obstacles / coins / particles ----------
 enum ObType { OB_BAMBOO = 0, OB_DEMON, OB_SPIKES, OB_ROCK };
@@ -175,35 +202,76 @@ void resetRun() {
   jumpT = 0; slashT = 0; iFrames = 0;
   spawnTimer = 70;
   newHi = false;
+  lastZoneIdx = 0; bannerT = 0;
   for (int i = 0; i < N_OBS; i++) obs[i].active = false;
   for (int i = 0; i < N_COINS; i++) coins[i].active = false;
   for (int i = 0; i < N_PARTS; i++) parts[i].active = false;
+  for (int i = 0; i < N_WX; i++) wxp[i].active = false;
 }
 
 // ---------- environment colors ----------
 uint8_t lerp8(uint8_t a, uint8_t b, float f) { return (uint8_t)(a + (b - a) * f); }
-uint16_t lerpRGB(const RGB *kf, float ph) {
-  int i = (int)ph;
-  float f = ph - i;
-  const RGB &a = kf[i & 3], &b = kf[(i + 1) & 3];
-  return C565(lerp8(a.r, b.r, f), lerp8(a.g, b.g, f), lerp8(a.b, b.b, f));
-}
 uint16_t scale565(uint16_t c, float k) {
   uint8_t r = ((c >> 11) << 3), g = (((c >> 5) & 0x3F) << 2), b = ((c & 0x1F) << 3);
   return C565((uint8_t)(r * k), (uint8_t)(g * k), (uint8_t)(b * k));
 }
 
+uint16_t mixRGB(const RGB &a, const RGB &b, float f) {
+  return C565(lerp8(a.r, b.r, f), lerp8(a.g, b.g, f), lerp8(a.b, b.b, f));
+}
+
+// lane center at a given screen row — the path S-curves through the world
+int pathCXat(int y) {
+  float world = dist + (SCR_H - y);
+  return NINJA_X + (int)(curveAmpNow * sinf(world * 0.011f));
+}
+
+int zoneAt(float worldPos) { return (int)(worldPos / ZONE_LEN) % 4; }
+
 void updateEnv() {
-  float ph = fmodf(dist / 2400.0f, 4.0f);       // full day cycle ~ every 9600 px
-  envSkyT     = lerpRGB(KF_SKY_T, ph);
-  envSkyB     = lerpRGB(KF_SKY_B, ph);
-  envGrass    = lerpRGB(KF_GRASS, ph);
-  envPath     = lerpRGB(KF_PATH,  ph);
+  float zPos = fmodf(dist, (float)ZONE_LEN);
+  int   zi   = (int)(dist / ZONE_LEN);
+  const ZoneDef &A = ZONES[zi % 4];
+  const ZoneDef &B = ZONES[(zi + 1) % 4];
+  float f = zPos > ZONE_LEN - 220 ? (zPos - (ZONE_LEN - 220)) / 220.0f : 0.0f;
+
+  envSkyT     = mixRGB(A.skyT, B.skyT, f);
+  envSkyB     = mixRGB(A.skyB, B.skyB, f);
+  envGrass    = mixRGB(A.grass, B.grass, f);
+  envPath     = mixRGB(A.path, B.path, f);
   envGrassDk  = scale565(envGrass, 0.72f);
   envPathEdge = scale565(envPath, 0.70f);
   envShadow   = scale565(envPath, 0.62f);
-  float d = fabsf(ph - 2.0f);                    // 0 at deep night
-  nightness = d > 1.0f ? 0.0f : 1.0f - d;
+  pathWNow    = A.pathW + (B.pathW - A.pathW) * f;
+  curveAmpNow = A.curveAmp + (B.curveAmp - A.curveAmp) * f;
+  nightness   = (A.night ? 1.0f : 0.0f) * (1 - f) + (B.night ? 1.0f : 0.0f) * f;
+  ninjaX      = pathCXat(NINJA_Y);
+}
+
+void updateWeather() {
+  const ZoneDef &Z = ZONES[zoneAt(dist)];
+  if (Z.weather != WX_NONE && t % 5 == 0) {
+    for (int i = 0; i < N_WX; i++) {
+      if (wxp[i].active) continue;
+      wxp[i].active = true;
+      wxp[i].kind = Z.weather;
+      if (Z.weather == WX_FIREFLY) {
+        wxp[i].x = random(5, SCR_W - 5); wxp[i].y = random(SKY_H + 20, 200);
+        wxp[i].vx = random(-3, 4) / 10.0f; wxp[i].vy = random(-3, 4) / 10.0f;
+      } else {
+        wxp[i].x = random(0, SCR_W); wxp[i].y = SKY_H - 2;
+        wxp[i].vx = 0; wxp[i].vy = (Z.weather == WX_SNOW ? 0.35f : 0.6f) + random(0, 4) / 10.0f;
+      }
+      break;
+    }
+  }
+  for (int i = 0; i < N_WX; i++) {
+    if (!wxp[i].active) continue;
+    wxp[i].x += wxp[i].vx + sinf((t + i * 37) * 0.1f) * (wxp[i].kind == WX_FIREFLY ? 0.1f : 0.35f);
+    wxp[i].y += wxp[i].vy + speedNow * 0.25f * (state == ST_PLAYING ? 1 : 0);
+    if (wxp[i].y > SCR_H + 4 || wxp[i].x < -4 || wxp[i].x > SCR_W + 4 ||
+        (wxp[i].kind == WX_FIREFLY && random(0, 200) == 0)) wxp[i].active = false;
+  }
 }
 
 // ---------- gameplay ----------
@@ -237,10 +305,14 @@ void spawnObstacle() {
     o.active = true;
     o.cleared = false;
     o.seed = (uint8_t)random(0, 255);
+    const ZoneDef &Z = ZONES[zoneAt(dist + SCR_H + 30)];   // zone where it will spawn
     int r = random(0, 100);
-    o.type = r < 30 ? OB_BAMBOO : r < 55 ? OB_DEMON : r < 80 ? OB_SPIKES : OB_ROCK;
+    o.type = r < Z.wBamboo                        ? OB_BAMBOO
+           : r < Z.wBamboo + Z.wDemon             ? OB_DEMON
+           : r < Z.wBamboo + Z.wDemon + Z.wSpikes ? OB_SPIKES : OB_ROCK;
     o.y = -30;
-    o.x = (o.type == OB_DEMON || o.type == OB_ROCK) ? NINJA_X + random(-10, 11) : NINJA_X;
+    // x is a lateral OFFSET from the lane center at the obstacle's row
+    o.x = (o.type == OB_DEMON || o.type == OB_ROCK) ? random(-10, 11) : 0;
 
     // sometimes drop a coin midway to the next obstacle
     if (random(0, 100) < 55) {
@@ -248,7 +320,7 @@ void spawnObstacle() {
         if (coins[c].active) continue;
         coins[c].active = true;
         coins[c].air = random(0, 100) < 40;
-        coins[c].x = NINJA_X + random(-8, 9);
+        coins[c].x = random(-8, 9);                        // offset from lane center
         coins[c].y = -30 - (spawnTimer * speedNow) * 0.5f;
         break;
       }
@@ -321,18 +393,38 @@ void update() {
     }
 
     case ST_PLAYING: {
-      speedNow = 2.0f + (dist * 0.00018f > 1.2f ? 1.2f : dist * 0.00018f);
+      float ramp = dist * 0.00014f; if (ramp > 1.2f) ramp = 1.2f;
+      float lap = (int)(dist / (ZONE_LEN * 4)) * 0.25f; if (lap > 1.0f) lap = 1.0f;
+      speedNow = 2.0f + ramp + lap;
+      if (speedNow > 3.5f) speedNow = 3.5f;
       dist += speedNow;
 
+      // crossing a zone gate: stage banner + heal
+      int zNow = (int)((dist + (SCR_H - NINJA_Y)) / ZONE_LEN);
+      if (zNow > lastZoneIdx) {
+        lastZoneIdx = zNow;
+        bannerT = 110;
+        bannerStage = zNow + 1;
+        bannerName = ZONES[zNow % 4].name;
+        score += 25 * multNow();
+        if (hearts < 3) { hearts++; spawnParticles(ninjaX, NINJA_Y - 20, COL_HEART, 8); }
+      }
+
       if (jumpPress && jumpT == 0) jumpT = 1;
-      if (jumpT > 0) { jumpT++; if (jumpT >= 30) { jumpT = 0; spawnParticles(NINJA_X, NINJA_Y + 2, envPathEdge, 3); } }
+      if (jumpT > 0) { jumpT++; if (jumpT >= 30) { jumpT = 0; spawnParticles(ninjaX, NINJA_Y + 2, envPathEdge, 3); } }
       if (slashPress && slashT == 0) slashT = 10;
       if (slashT > 0) slashT--;
       if (iFrames > 0) iFrames--;
 
       if (--spawnTimer <= 0) {
-        spawnObstacle();
-        spawnTimer = (int)((60 + random(0, 40)) * (2.0f / speedNow));
+        // keep a clear runway around each zone gate
+        float zPos = fmodf(dist + SCR_H + 30, (float)ZONE_LEN);
+        if (zPos > ZONE_LEN - 130 || zPos < 90) {
+          spawnTimer = 15;
+        } else {
+          spawnObstacle();
+          spawnTimer = (int)((60 + random(0, 40)) * (2.0f / speedNow));
+        }
       }
 
       float z = jumpZ();
@@ -349,7 +441,8 @@ void update() {
           o.active = false;
           combo++;
           score += 10 * multNow();
-          spawnParticles(o.x, o.y, o.type == OB_BAMBOO ? COL_BAMBOO : COL_DEMON, 8);
+          spawnParticles(pathCXat((int)o.y) + o.x, o.y,
+                         o.type == OB_BAMBOO ? COL_BAMBOO : COL_DEMON, 8);
           continue;
         }
 
@@ -360,7 +453,7 @@ void update() {
             o.cleared = true;
           } else if (iFrames == 0) {
             o.active = false;
-            hitNinja(o.x, o.y - 6);
+            hitNinja(pathCXat((int)o.y) + o.x, o.y - 6);
             continue;
           }
         }
@@ -377,15 +470,15 @@ void update() {
         if (!coins[i].active) continue;
         Coin &c = coins[i];
         c.y += speedNow;
-        bool inReach = fabsf(c.y - NINJA_Y) < 10 && fabsf(c.x - NINJA_X) < 13;
+        bool inReach = fabsf(c.y - NINJA_Y) < 10 && fabsf(c.x) < 13;
         bool heightOk = c.air ? (z > 7.0f) : (z < 4.0f);
         if (inReach && heightOk) {
           c.active = false;
           coinCount++;
           score += 5 * multNow();
-          spawnParticles(c.x, c.y, COL_COIN, 5);
+          spawnParticles(pathCXat((int)c.y) + c.x, c.y, COL_COIN, 5);
           if (coinCount % 10 == 0) {
-            if (hearts < 3) { hearts++; spawnParticles(NINJA_X, NINJA_Y - 20, COL_HEART, 8); }
+            if (hearts < 3) { hearts++; spawnParticles(ninjaX, NINJA_Y - 20, COL_HEART, 8); }
             else score += 50;
           }
         }
@@ -422,6 +515,8 @@ void update() {
     parts[i].vy += 0.12f;
     if (--parts[i].life <= 0) parts[i].active = false;
   }
+
+  if (state != ST_PRESENTER) updateWeather();
 
   t++;
   stateT++;
@@ -465,30 +560,47 @@ void drawNinja(int x, int yFeet, float z, bool dead) {
 }
 
 void drawObstacle(const Obstacle &o) {
-  int x = (int)o.x, y = (int)o.y;
+  int y = (int)o.y;
+  int cx = pathCXat(y) + (int)o.x;   // o.x is the lateral offset from lane center
   switch (o.type) {
     case OB_BAMBOO: {
-      spr.fillEllipse(NINJA_X, y + 6, PATH_W / 2 - 2, 3, envShadow);
-      blitSpr(SPR_BAMBOO, NINJA_X, y + 8);
+      spr.fillEllipse(cx, y + 6, (int)pathWNow / 2 - 2, 3, envShadow);
+      blitSpr(SPR_BAMBOO, cx, y + 8);
       break;
     }
     case OB_DEMON: {
-      x += (int)(sinf((t + o.seed) * 0.2f) * 3);
-      spr.fillEllipse(x, y + 7, 10, 3, envShadow);
-      blitSpr(((t + o.seed) / 8) % 2 == 0 ? SPR_DEMON_A : SPR_DEMON_B, x, y + 9);
+      cx += (int)(sinf((t + o.seed) * 0.2f) * 3);
+      spr.fillEllipse(cx, y + 7, 10, 3, envShadow);
+      blitSpr(((t + o.seed) / 8) % 2 == 0 ? SPR_DEMON_A : SPR_DEMON_B, cx, y + 9);
       break;
     }
     case OB_SPIKES: {
-      blitSpr(SPR_SPIKES, NINJA_X, y + 7);
+      blitSpr(SPR_SPIKES, cx, y + 7);
       break;
     }
     case OB_ROCK: {
-      spr.fillEllipse(x, y + 10, 11, 3, envShadow);
+      spr.fillEllipse(cx, y + 10, 11, 3, envShadow);
       int f = ((int)(dist * 0.12f) + o.seed) % 3;
-      blitSpr(f == 0 ? SPR_ROCK_A : f == 1 ? SPR_ROCK_B : SPR_ROCK_C, x, y + 11);
+      blitSpr(f == 0 ? SPR_ROCK_A : f == 1 ? SPR_ROCK_B : SPR_ROCK_C, cx, y + 11);
       break;
     }
   }
+}
+
+// a big torii gate spanning the lane at each zone boundary
+void drawGate(int y) {
+  int cx = pathCXat(y);
+  int half = (int)pathWNow / 2 + 7;
+  uint16_t R = C565(200, 44, 40);
+  spr.fillRect(cx - half - 5, y - 32, 6, 34, R);
+  spr.drawRect(cx - half - 5, y - 32, 6, 34, COL_OUTLINE);
+  spr.fillRect(cx + half - 1, y - 32, 6, 34, R);
+  spr.drawRect(cx + half - 1, y - 32, 6, 34, COL_OUTLINE);
+  spr.fillRect(cx - half - 12, y - 40, half * 2 + 24, 6, R);
+  spr.drawRect(cx - half - 12, y - 40, half * 2 + 24, 6, COL_OUTLINE);
+  spr.fillRect(cx - half - 8, y - 30, half * 2 + 16, 3, R);
+  spr.fillRect(cx - 7, y - 30, 14, 9, C565(240, 230, 200));
+  spr.drawRect(cx - 7, y - 30, 14, 9, COL_OUTLINE);
 }
 
 void renderPresenter() {
@@ -570,12 +682,15 @@ void render() {
   spr.fillTriangle(40, SKY_H, 85, 4, 132, SKY_H, mt);
   spr.fillTriangle(100, SKY_H, 130, 14, 160, SKY_H, mt);
 
-  // grass + path
-  spr.fillRect(0, SKY_H, PATH_L, SCR_H - SKY_H, envGrass);
-  spr.fillRect(PATH_R, SKY_H, SCR_W - PATH_R, SCR_H - SKY_H, envGrass);
-  spr.fillRect(PATH_L, SKY_H, PATH_W, SCR_H - SKY_H, envPath);
-  spr.fillRect(PATH_L, SKY_H, 2, SCR_H - SKY_H, envPathEdge);
-  spr.fillRect(PATH_R - 2, SKY_H, 2, SCR_H - SKY_H, envPathEdge);
+  // grass + curving path, drawn per scanline
+  for (int y = SKY_H; y < SCR_H; y++) {
+    int cx = pathCXat(y);
+    int half = (int)pathWNow / 2;
+    spr.drawFastHLine(0, y, SCR_W, envGrass);
+    spr.drawFastHLine(cx - half, y, half * 2, envPath);
+    spr.drawFastHLine(cx - half, y, 2, envPathEdge);
+    spr.drawFastHLine(cx + half - 2, y, 2, envPathEdge);
+  }
 
   // scrolling decorations
   int off28 = (int)dist % 28;
@@ -583,23 +698,39 @@ void render() {
     if (y > SKY_H + 2) {
       spr.fillRect(8, y, 5, 2, envGrassDk);                    // grass tufts
       spr.fillRect(118, y + 9, 5, 2, envGrassDk);
-      spr.drawFastHLine(NINJA_X - 2 + ((y / 28) % 2) * 8, y + 4, 5, envPathEdge);  // path pebbles
+      spr.drawFastHLine(pathCXat(y) - 2 + ((y / 28) % 2) * 8, y + 4, 5, envPathEdge);
     }
   }
   int off90 = (int)dist % 90;
   int segId = (int)(dist / 90);
   for (int y = SKY_H - 20 + off90; y < SCR_H + 20; y += 90, segId--) {
-    if (y > SKY_H + 6) {                                        // roadside scenery
-      blitSpr((segId & 1) ? SPR_TREE_A : SPR_LANTERN, 14, y + 6);
-      blitSpr((segId & 1) ? SPR_TORII : SPR_TREE_B, 121, y + 46);
+    if (y > SKY_H + 6) {                                        // roadside scenery by zone
+      const SpriteImg *L, *R;
+      switch (zoneAt(dist + (SCR_H - y) + ZONE_LEN * 8)) {      // +8 laps keeps it positive
+        default:
+        case 0: L = (segId & 1) ? &SPR_TREE_A : &SPR_TREE_B; R = &SPR_TREE_A;  break;
+        case 1: L = &SPR_LANTERN;                            R = &SPR_TORII;   break;
+        case 2: L = (segId & 1) ? &SPR_ROCK_B : &SPR_ROCK_A; R = &SPR_ROCK_C;  break;
+        case 3: L = &SPR_TREE_B;                             R = &SPR_LANTERN; break;
+      }
+      blitSpr(*L, 14, y + 6);
+      blitSpr(*R, 121, y + 46);
     }
+  }
+
+  // zone gates in view
+  int ziBase = (int)(dist / ZONE_LEN);
+  for (int k = ziBase; k <= ziBase + 2; k++) {
+    if (k < 1) continue;
+    int gy = SCR_H - (int)(k * (float)ZONE_LEN - dist);
+    if (gy > SKY_H - 45 && gy < SCR_H + 45) drawGate(gy);
   }
 
   // coins, obstacles, ninja
   for (int i = 0; i < N_COINS; i++) {
     if (!coins[i].active) continue;
-    int cx = (int)coins[i].x;
     int cy = (int)coins[i].y + (coins[i].air ? (int)(sinf(t * 0.2f + i) * 2) : 0);
+    int cx = pathCXat(cy) + (int)coins[i].x;
     int f = (t / 5 + i) % 4;
     const SpriteImg &ci = f == 0 ? SPR_COIN_A : f == 1 ? SPR_COIN_B
                         : f == 2 ? SPR_COIN_C : SPR_COIN_D;
@@ -610,13 +741,26 @@ void render() {
     if (obs[i].active) drawObstacle(obs[i]);
 
   if (state == ST_DYING) {
-    drawNinja(NINJA_X, NINJA_Y + (int)(stateT * 1.2f), 0, true);
+    drawNinja(ninjaX, NINJA_Y + (int)(stateT * 1.2f), 0, true);
   } else if (state != ST_TITLE) {
-    drawNinja(NINJA_X, NINJA_Y, jumpZ(), false);
+    drawNinja(ninjaX, NINJA_Y, jumpZ(), false);
   }
 
   for (int i = 0; i < N_PARTS; i++)
     if (parts[i].active) spr.fillRect((int)parts[i].x, (int)parts[i].y, 2, 2, parts[i].col);
+
+  // weather
+  for (int i = 0; i < N_WX; i++) {
+    if (!wxp[i].active) continue;
+    int wx_ = (int)wxp[i].x, wy = (int)wxp[i].y;
+    switch (wxp[i].kind) {
+      case WX_LEAVES: spr.fillRect(wx_, wy, 2, 2, (i & 1) ? COL_BAMBOO : COL_COIN); break;
+      case WX_SNOW:   spr.fillRect(wx_, wy, 2, 2, TFT_WHITE); break;
+      case WX_FIREFLY:
+        if (((t / 8) + i) % 3 != 0) spr.fillRect(wx_, wy, 2, 2, COL_COIN);
+        break;
+    }
+  }
 
   // ---------- UI ----------
   bool blink = (t / 22) % 2 == 0;
@@ -631,7 +775,7 @@ void render() {
       spr.drawString("SLASH &", 68, 40, 4);
       spr.drawString("LEAP", 68, 66, 4);
 
-      drawNinja(NINJA_X, 150 + (int)(sinf(t * 0.09f) * 2), 0, false);
+      drawNinja(pathCXat(150), 150 + (int)(sinf(t * 0.09f) * 2), 0, false);
 
       spr.setTextColor(TFT_WHITE);
       spr.setTextDatum(TL_DATUM);
@@ -666,6 +810,17 @@ void render() {
         spr.setTextDatum(TR_DATUM);
         spr.setTextColor(multNow() >= 6 ? COL_RED : multNow() >= 3 ? COL_COIN : TFT_WHITE);
         spr.drawString("x" + String(multNow()), 131, 16, 2);
+      }
+      // stage banner on entering a new zone
+      if (bannerT > 0) {
+        bannerT--;
+        spr.setTextDatum(TC_DATUM);
+        spr.fillRoundRect(8, 92, 119, 36, 6, COL_PANEL);
+        spr.drawRoundRect(8, 92, 119, 36, 6, COL_OUTLINE);
+        spr.setTextColor(COL_TEXT_DK);
+        spr.drawString("STAGE " + String(bannerStage), 68, 97, 2);
+        spr.setTextColor(COL_RED);
+        spr.drawString(bannerName, 68, 112, 2);
       }
       break;
     }
@@ -746,6 +901,7 @@ void loop() {
     if (c == 'K') serialSlash = true;
     if (c == 'S') dumpScreenshot();
     if (c == 'P') { if (state != ST_PRESENTER) enterPresenter(); else ESP.restart(); }
+    if (c == 'D') dist += ZONE_LEN;   // debug: skip ahead one zone
   }
 
   btnJump.poll();
