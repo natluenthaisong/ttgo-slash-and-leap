@@ -14,7 +14,9 @@
 #include <TFT_eSPI.h>
 #include <Preferences.h>
 #include <BleKeyboard.h>
+#include <NimBLEDevice.h>
 #include <esp_system.h>
+#include "sprites.h"
 
 TFT_eSPI tft;
 TFT_eSprite spr(&tft);
@@ -207,7 +209,10 @@ void updateEnv() {
 // ---------- gameplay ----------
 void enterPresenter() {
   if (!bleStarted) {           // BLE stays off in game mode; started once on demand
+    bleKeyboard.setDelay(12);
     bleKeyboard.begin();
+    // macOS ignores HID input unless the bond uses MITM + LE Secure Connections
+    NimBLEDevice::setSecurityAuth(true, true, true);
     bleStarted = true;
   }
   slideNum = 1;
@@ -296,12 +301,17 @@ void update() {
       } else {
         presExitHold = 0;
         if (bleKeyboard.isConnected()) {
+          // press-hold-release: instantaneous write() can be dropped by macOS
           if (jumpPress) {
-            bleKeyboard.write(KEY_LEFT_ARROW);
+            bleKeyboard.press(KEY_LEFT_ARROW);
+            delay(25);
+            bleKeyboard.release(KEY_LEFT_ARROW);
             if (slideNum > 1) slideNum--;
           }
           if (slashPress) {
-            bleKeyboard.write(KEY_RIGHT_ARROW);
+            bleKeyboard.press(KEY_RIGHT_ARROW);
+            delay(25);
+            bleKeyboard.release(KEY_RIGHT_ARROW);
             slideNum++;
             if (timerStartMs == 0) timerStartMs = millis();
           }
@@ -418,23 +428,20 @@ void update() {
 }
 
 // ---------- drawing ----------
-void drawHeart(int x, int y, bool filled) {
-  uint16_t c = filled ? COL_HEART : COL_HEART_E;
-  spr.fillCircle(x + 2, y + 2, 2, c);
-  spr.fillCircle(x + 6, y + 2, 2, c);
-  spr.fillTriangle(x, y + 3, x + 8, y + 3, x + 4, y + 9, c);
-  if (!filled) {
-    spr.fillCircle(x + 2, y + 2, 1, envSkyT);
-    spr.fillCircle(x + 6, y + 2, 1, envSkyT);
-    spr.fillTriangle(x + 2, y + 4, x + 6, y + 4, x + 4, y + 7, envSkyT);
-  }
+// blit a sprite-sheet image anchored at bottom-center; magenta pixels are skipped
+void blitSpr(const SpriteImg &s, int cx, int bottomY) {
+  int x0 = cx - s.w / 2;
+  int y0 = bottomY - s.h;
+  for (int yy = 0; yy < s.h; yy++)
+    for (int xx = 0; xx < s.w; xx++) {
+      uint16_t c = s.data[yy * s.w + xx];
+      if (c != SPR_KEY) spr.drawPixel(x0 + xx, y0 + yy, c);
+    }
 }
+void blitSprC(const SpriteImg &s, int cx, int cy) { blitSpr(s, cx, cy + s.h / 2); }
 
-void drawCoinIcon(int x, int y, int r, bool airRing) {
-  if (airRing) spr.drawCircle(x, y, r + 3, TFT_WHITE);
-  spr.fillCircle(x, y, r, COL_COIN);
-  spr.drawCircle(x, y, r, COL_COIN_D);
-  spr.drawPixel(x - 1, y - 1, TFT_WHITE);
+void drawHeart(int x, int y, bool filled) {
+  blitSpr(filled ? SPR_HEART_FULL : SPR_HEART_EMPTY, x + 5, y + 10);
 }
 
 void drawNinja(int x, int yFeet, float z, bool dead) {
@@ -447,79 +454,38 @@ void drawNinja(int x, int yFeet, float z, bool dead) {
 
   if (iFrames > 0 && (t / 3) % 2 == 0 && !dead) return;   // blink while invincible
 
-  int leg = ((int)(dist / 6) % 2 == 0) ? 1 : -1;
-  if (z > 2) leg = 0;
-
-  // legs
-  spr.fillRect(x - 5, y - 5 + (leg == 1 ? 1 : 0), 4, 6, COL_NAVY_DK);
-  spr.fillRect(x + 1, y - 5 + (leg == -1 ? 1 : 0), 4, 6, COL_NAVY_DK);
-  // body
-  spr.fillRoundRect(x - 6, y - 16, 12, 12, 3, COL_NAVY);
-  spr.drawRoundRect(x - 6, y - 16, 12, 12, 3, COL_OUTLINE);
-  // red belt/scarf trailing downward as we run up
-  int flick = (t / 4) % 2 == 0 ? 1 : -1;
-  spr.fillRect(x - 1 + flick, y - 6, 3, 6, COL_RED);
-  // sword on the back (hidden mid-swing)
-  if (slashT == 0) spr.drawLine(x - 7, y - 20, x + 2, y - 11, TFT_WHITE);
-  // head + headband (seen from behind)
-  spr.fillCircle(x, y - 20, 5, COL_NAVY);
-  spr.drawCircle(x, y - 20, 5, COL_OUTLINE);
-  spr.fillRect(x - 5, y - 22, 10, 3, COL_RED);
-  spr.fillCircle(x, y - 24, 1, COL_SKIN);      // top knot
-
-  if (dead) {
-    spr.fillEllipse(x, y - 20, 3, 2, TFT_WHITE);  // dizzy swirl
-  }
-
-  // slash crescent sweeping the zone ahead (above)
-  if (slashT >= 4) {
-    spr.fillEllipse(x, y - 30, 16, 9, TFT_WHITE);
-    spr.fillEllipse(x, y - 26, 16, 9, envPath);
-    spr.drawLine(x - 10, y - 34, x + 12, y - 30, COL_SPIKE);
-  }
+  const SpriteImg *img;
+  if (dead)              img = &SPR_NINJA_DEAD;
+  else if (iFrames > 50) img = &SPR_NINJA_HURT;
+  else if (slashT >= 7)  img = &SPR_NINJA_WINDUP;
+  else if (slashT > 0)   img = &SPR_NINJA_SWING;
+  else if (z > 2)        img = &SPR_NINJA_LEAP;
+  else                   img = ((int)(dist / 6) % 2 == 0) ? &SPR_NINJA_RUN_A : &SPR_NINJA_RUN_B;
+  blitSpr(*img, x, y + 2);
 }
 
 void drawObstacle(const Obstacle &o) {
   int x = (int)o.x, y = (int)o.y;
   switch (o.type) {
     case OB_BAMBOO: {
-      spr.fillEllipse(NINJA_X, y + 5, PATH_W / 2 - 4, 3, envShadow);
-      spr.fillRoundRect(PATH_L + 4, y - 5, PATH_W - 8, 10, 4, COL_BAMBOO);
-      spr.drawRoundRect(PATH_L + 4, y - 5, PATH_W - 8, 10, 4, COL_BAMBOO_D);
-      for (int nx = PATH_L + 18; nx < PATH_R - 8; nx += 16)
-        spr.drawFastVLine(nx, y - 5, 10, COL_BAMBOO_D);
-      spr.fillTriangle(PATH_R - 6, y - 5, PATH_R + 4, y - 11, PATH_R - 1, y - 3, COL_BAMBOO);
+      spr.fillEllipse(NINJA_X, y + 6, PATH_W / 2 - 2, 3, envShadow);
+      blitSpr(SPR_BAMBOO, NINJA_X, y + 8);
       break;
     }
     case OB_DEMON: {
-      int wob = (int)(sinf((t + o.seed) * 0.2f) * 3);
-      x += wob;
-      spr.fillEllipse(x, y + 6, 9, 3, envShadow);
-      spr.fillRoundRect(x - 8, y - 7, 16, 14, 4, COL_DEMON);
-      spr.drawRoundRect(x - 8, y - 7, 16, 14, 4, COL_DEMON_D);
-      spr.fillTriangle(x - 6, y - 6, x - 4, y - 12, x - 2, y - 6, TFT_WHITE);
-      spr.fillTriangle(x + 2, y - 6, x + 4, y - 12, x + 6, y - 6, TFT_WHITE);
-      spr.fillCircle(x - 3, y - 1, 1, TFT_WHITE);
-      spr.fillCircle(x + 3, y - 1, 1, TFT_WHITE);
-      spr.drawFastHLine(x - 3, y + 4, 6, COL_DEMON_D);   // grumpy mouth
+      x += (int)(sinf((t + o.seed) * 0.2f) * 3);
+      spr.fillEllipse(x, y + 7, 10, 3, envShadow);
+      blitSpr(((t + o.seed) / 8) % 2 == 0 ? SPR_DEMON_A : SPR_DEMON_B, x, y + 9);
       break;
     }
     case OB_SPIKES: {
-      spr.fillRect(PATH_L + 3, y + 2, PATH_W - 6, 4, COL_SPIKE_D);
-      for (int sx = PATH_L + 4; sx < PATH_R - 8; sx += 10) {
-        spr.fillTriangle(sx, y + 3, sx + 5, y - 7, sx + 10, y + 3, COL_SPIKE);
-        spr.drawLine(sx + 5, y - 7, sx + 10, y + 3, COL_SPIKE_D);
-      }
+      blitSpr(SPR_SPIKES, NINJA_X, y + 7);
       break;
     }
     case OB_ROCK: {
-      spr.fillEllipse(x, y + 8, 11, 3, envShadow);
-      spr.fillCircle(x, y, 11, COL_ROCK);
-      spr.drawCircle(x, y, 11, COL_ROCK_D);
-      // rolling texture
-      float a = dist * 0.15f + o.seed;
-      spr.fillCircle(x + (int)(cosf(a) * 5), y + (int)(sinf(a) * 5), 2, COL_ROCK_D);
-      spr.fillCircle(x - (int)(cosf(a) * 4), y - (int)(sinf(a) * 4), 1, COL_ROCK_D);
+      spr.fillEllipse(x, y + 10, 11, 3, envShadow);
+      int f = ((int)(dist * 0.12f) + o.seed) % 3;
+      blitSpr(f == 0 ? SPR_ROCK_A : f == 1 ? SPR_ROCK_B : SPR_ROCK_C, x, y + 11);
       break;
     }
   }
@@ -621,20 +587,24 @@ void render() {
     }
   }
   int off90 = (int)dist % 90;
-  for (int y = SKY_H - 20 + off90; y < SCR_H + 20; y += 90) {
-    if (y > SKY_H + 6) {                                        // trees on both sides
-      spr.fillRect(13, y, 3, 6, COL_ROCK_D);
-      spr.fillCircle(14, y - 4, 7, envGrassDk);
-      spr.fillRect(119, y + 40, 3, 6, COL_ROCK_D);
-      spr.fillCircle(120, y + 36, 7, envGrassDk);
+  int segId = (int)(dist / 90);
+  for (int y = SKY_H - 20 + off90; y < SCR_H + 20; y += 90, segId--) {
+    if (y > SKY_H + 6) {                                        // roadside scenery
+      blitSpr((segId & 1) ? SPR_TREE_A : SPR_LANTERN, 14, y + 6);
+      blitSpr((segId & 1) ? SPR_TORII : SPR_TREE_B, 121, y + 46);
     }
   }
 
   // coins, obstacles, ninja
   for (int i = 0; i < N_COINS; i++) {
     if (!coins[i].active) continue;
-    int bob = coins[i].air ? (int)(sinf(t * 0.2f + i) * 2) : 0;
-    drawCoinIcon((int)coins[i].x, (int)coins[i].y + bob, 4, coins[i].air);
+    int cx = (int)coins[i].x;
+    int cy = (int)coins[i].y + (coins[i].air ? (int)(sinf(t * 0.2f + i) * 2) : 0);
+    int f = (t / 5 + i) % 4;
+    const SpriteImg &ci = f == 0 ? SPR_COIN_A : f == 1 ? SPR_COIN_B
+                        : f == 2 ? SPR_COIN_C : SPR_COIN_D;
+    if (coins[i].air) spr.drawCircle(cx, cy, 9, TFT_WHITE);
+    blitSprC(ci, cx, cy);
   }
   for (int i = 0; i < N_OBS; i++)
     if (obs[i].active) drawObstacle(obs[i]);
@@ -689,9 +659,9 @@ void render() {
       spr.setTextColor(TFT_WHITE);
       spr.drawNumber(score, 131, 2, 2);
       spr.setTextDatum(TL_DATUM);
-      drawCoinIcon(9, 22, 4, false);
+      blitSprC(SPR_COIN_A, 9, 22);
       spr.setTextColor(TFT_WHITE);
-      spr.drawNumber(coinCount, 17, 16, 2);
+      spr.drawNumber(coinCount, 18, 16, 2);
       if (multNow() > 1) {
         spr.setTextDatum(TR_DATUM);
         spr.setTextColor(multNow() >= 6 ? COL_RED : multNow() >= 3 ? COL_COIN : TFT_WHITE);

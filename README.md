@@ -5,7 +5,7 @@ A vertical ninja runner for the **LilyGO TTGO T-Display** (ESP32, 1.14" ST7789, 
 <p align="center">
   <img src="images/title.png" width="24%" alt="Title screen">
   <img src="images/gameplay.png" width="24%" alt="A demon approaches">
-  <img src="images/dusk.png" width="24%" alt="Dusk, one heart left">
+  <img src="images/bamboo.png" width="24%" alt="Bamboo stalk ahead">
   <img src="images/gameover.png" width="24%" alt="Game over">
 </p>
 
