@@ -13,6 +13,7 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <Preferences.h>
+#include <BleKeyboard.h>
 #include <esp_system.h>
 
 TFT_eSPI tft;
@@ -132,8 +133,16 @@ void spawnParticles(float x, float y, uint16_t col, int n) {
 }
 
 // ---------- game state ----------
-enum State { ST_TITLE, ST_PLAYING, ST_DYING, ST_OVER };
+enum State { ST_TITLE, ST_PLAYING, ST_DYING, ST_OVER, ST_PRESENTER };
 State state = ST_TITLE;
+
+// ---------- presenter (BLE slide clicker) mode ----------
+BleKeyboard bleKeyboard("Slash & Leap Remote", "LilyGO", 100);
+bool     bleStarted = false;
+int      slashHoldFrames = 0;   // hold RIGHT on title to enter presenter
+int      presExitHold = 0;      // hold BOTH in presenter to exit
+int      slideNum = 1;
+uint32_t timerStartMs = 0;      // talk timer, starts on first "next"
 
 float    dist = 0;          // world distance scrolled (px)
 float    speedNow = 2.0f;
@@ -196,6 +205,17 @@ void updateEnv() {
 }
 
 // ---------- gameplay ----------
+void enterPresenter() {
+  if (!bleStarted) {           // BLE stays off in game mode; started once on demand
+    bleKeyboard.begin();
+    bleStarted = true;
+  }
+  slideNum = 1;
+  timerStartMs = 0;
+  presExitHold = 0;
+  setState(ST_PRESENTER);
+}
+
 void hitNinja(float ox, float oy) {
   spawnParticles(ox, oy, COL_RED, 6);
   hearts--;
@@ -247,12 +267,45 @@ void update() {
           prefs.putUInt("hi", 0);
           toastUntil = t + 90;
         }
+        slashHoldFrames = -40;   // lockout: releasing after a both-hold shouldn't start a run
       } else {
         bothHoldFrames = 0;
+        bool startRun = jumpPress || (slashPress && !btnSlash.down);   // serial 'K' starts instantly
+        if (btnSlash.down) {
+          // RIGHT is start-on-release so a long hold can open presenter mode instead
+          if (++slashHoldFrames == 75) {
+            slashHoldFrames = 0;
+            enterPresenter();
+            break;
+          }
+        } else {
+          if (slashHoldFrames > 0) startRun = true;   // short tap released
+          slashHoldFrames = 0;
+        }
+        if (startRun) {
+          resetRun();
+          setState(ST_PLAYING);
+        }
       }
-      if (anyClick && !(btnJump.down && btnSlash.down)) {
-        resetRun();
-        setState(ST_PLAYING);
+      break;
+    }
+
+    case ST_PRESENTER: {
+      if (btnJump.down && btnSlash.down) {
+        if (++presExitHold >= 75) ESP.restart();     // clean way back to game mode
+      } else {
+        presExitHold = 0;
+        if (bleKeyboard.isConnected()) {
+          if (jumpPress) {
+            bleKeyboard.write(KEY_LEFT_ARROW);
+            if (slideNum > 1) slideNum--;
+          }
+          if (slashPress) {
+            bleKeyboard.write(KEY_RIGHT_ARROW);
+            slideNum++;
+            if (timerStartMs == 0) timerStartMs = millis();
+          }
+        }
       }
       break;
     }
@@ -472,7 +525,61 @@ void drawObstacle(const Obstacle &o) {
   }
 }
 
+void renderPresenter() {
+  const uint16_t BG     = C565(26, 30, 44);
+  const uint16_t GREY   = C565(140, 148, 168);
+  const uint16_t GREEN  = C565(80, 220, 120);
+  const uint16_t AMBER  = C565(255, 190, 60);
+  bool blink = (t / 22) % 2 == 0;
+
+  spr.fillSprite(BG);
+  // faint mountain silhouettes at the bottom for identity
+  uint16_t mt = C565(38, 44, 64);
+  spr.fillTriangle(0, 240, 30, 214, 68, 240, mt);
+  spr.fillTriangle(45, 240, 95, 206, 140, 240, mt);
+
+  spr.setTextDatum(TC_DATUM);
+  spr.setTextColor(GREY);
+  spr.drawString("PRESENTER", 68, 10, 2);
+
+  bool conn = bleKeyboard.isConnected();
+  if (conn) {
+    spr.setTextColor(GREEN);
+    spr.drawString("CONNECTED", 68, 30, 2);
+  } else if (blink) {
+    spr.setTextColor(AMBER);
+    spr.drawString("PAIRING...", 68, 30, 2);
+  }
+
+  spr.setTextColor(GREY);
+  spr.drawString("SLIDE", 68, 56, 2);
+  spr.setTextColor(TFT_WHITE);
+  spr.drawNumber(slideNum, 68, 72, 6);
+
+  spr.setTextColor(GREY);
+  spr.drawString("TIME", 68, 130, 2);
+  uint32_t secs = timerStartMs ? (millis() - timerStartMs) / 1000 : 0;
+  String tstr = String(secs / 60) + ":" + (secs % 60 < 10 ? "0" : "") + String(secs % 60);
+  spr.setTextColor(TFT_WHITE);
+  spr.drawString(tstr, 68, 146, 4);
+
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(TFT_WHITE);
+  spr.drawString("< PREV", 8, 190, 2);
+  spr.setTextDatum(TR_DATUM);
+  spr.drawString("NEXT >", 127, 190, 2);
+  spr.setTextDatum(TC_DATUM);
+  spr.setTextColor(GREY);
+  spr.drawString("HOLD BOTH = EXIT", 68, 214, 2);
+}
+
 void render() {
+  if (state == ST_PRESENTER) {
+    renderPresenter();
+    spr.pushSprite(0, 0);
+    return;
+  }
+
   // sky band with gradient + celestial body
   for (int y = 0; y < SKY_H; y++) {
     float f = (float)y / (SKY_H - 1);
@@ -564,6 +671,7 @@ void render() {
       spr.setTextDatum(TC_DATUM);
       spr.setTextColor(COL_OUTLINE);
       if (t < toastUntil)      spr.drawString("BEST RESET!", 68, 220, 2);
+      else if ((t / 110) % 2 == 1) spr.drawString("HOLD R: PRESENTER", 68, 220, 2);
       else if (blink)          spr.drawString("PRESS ANY BUTTON", 68, 220, 2);
       if (hiScore > 0) {
         spr.setTextColor(TFT_WHITE);
@@ -667,6 +775,7 @@ void loop() {
     if (c == 'J') serialJump = true;
     if (c == 'K') serialSlash = true;
     if (c == 'S') dumpScreenshot();
+    if (c == 'P') { if (state != ST_PRESENTER) enterPresenter(); else ESP.restart(); }
   }
 
   btnJump.poll();

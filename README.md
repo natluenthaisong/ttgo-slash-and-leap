@@ -19,6 +19,7 @@ Hold the board portrait, USB at the bottom — the buttons fall under your thumb
 |---|---|
 | **Left** button | Leap (hop with a drop-shadow; clears ground obstacles passing beneath you) |
 | **Right** button | Slash (blade arc ahead of you) |
+| Hold **right** ~1.5 s on title | Enter **Presenter mode** (BLE slide clicker) |
 | Hold both ~1.5 s on title | Reset the best score |
 
 Strict pairing — every obstacle has exactly one correct answer:
@@ -35,6 +36,19 @@ Strict pairing — every obstacle has exactly one correct answer:
 - **Coins**: ground coins are grabbed while grounded, ringed **air coins only mid-leap**. Every 10th coin restores a lost heart (or +50 score at full health).
 - **Day-night cycle**: the palette rolls through day, dusk, starry night, and dawn as you run.
 - Best score survives power-off (NVS flash).
+
+## Presenter mode 🎤
+
+<img src="images/presenter.png" width="24%" align="right" alt="Presenter mode">
+
+The board doubles as a wireless presentation clicker. Hold the **right** button ~1.5 s on the title screen and it starts advertising as a Bluetooth keyboard named **"Slash & Leap Remote"** — pair it from your computer's Bluetooth settings (first time only; it reconnects automatically after that).
+
+- **Left** button sends ← (previous slide), **right** sends → (next slide) — works in Keynote, PowerPoint, and Google Slides.
+- The screen shows connection status, a **slide counter**, and a **talk timer** that starts on your first "next".
+- Hold **both** buttons ~1.5 s to exit back to the game (the device restarts; Bluetooth stays off in game mode).
+- Runs fine from a power bank or a LiPo on the battery connector — no USB tether needed while presenting.
+
+<br clear="all">
 
 ## Build & flash
 
@@ -58,6 +72,7 @@ Connect at 115200 baud and send:
 
 - `S` — dumps the current frame as raw RGB565 (`SNAP\n` + 64800 bytes). The README screenshots were captured this way.
 - `J` / `K` — remote leap / slash, so the game can be driven (or demoed) over USB.
+- `P` — toggle Presenter mode (enters it, or restarts back to the game).
 
 ## Tuning
 
